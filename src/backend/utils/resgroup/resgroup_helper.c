@@ -16,6 +16,7 @@
 #include "libpq-fe.h"
 #include "miscadmin.h"
 #include "catalog/pg_resgroup.h"
+#include "catalog/pg_proc.h"
 #include "cdb/cdbdisp_query.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbvars.h"
@@ -26,7 +27,11 @@
 #include "utils/resgroup.h"
 #include "utils/cgroup.h"
 #include "utils/resource_manager.h"
+#include "utils/syscache.h"
 
+//define oid for pg_resgroup_get_status function, according to pg_proc.dat
+#define pg_resgroup_get_status_oid 6066
+#define num_executed_order_in_columns 5
 typedef struct ResGroupStat
 {
 	Datum groupId;
@@ -179,6 +184,25 @@ compareRow(const void *ptr1, const void *ptr2)
 	return row1->groupId - row2->groupId;
 }
 
+static bool 
+isResgroupUsingInt4()
+{
+	Datum		protrftypes_datum;
+	bool		isnull;
+	HeapTuple	procTup;
+	bool		res;
+	ListCell*	lc;
+
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(pg_resgroup_get_status_oid));
+	protrftypes_datum = SysCacheGetAttr(PROCOID, procTup, Anum_pg_proc_proallargtypes, &isnull);
+	List* typelist = oid_array_to_list(protrftypes_datum);
+	res =  typelist == NIL ? false : list_nth_oid(typelist, num_executed_order_in_columns) == INT4OID;
+	
+	ReleaseSysCache(procTup);
+	return res;
+}
+
+
 /*
  * Get status of resource groups
  */
@@ -202,8 +226,24 @@ pg_resgroup_get_status(PG_FUNCTION_ARGS)
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "groupid", OIDOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "num_running", INT4OID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 3, "num_queueing", INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 4, "num_queued", INT4OID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 5, "num_executed", INT4OID, -1, 0);
+		
+		/*
+		 * change type of num_queued/num_executed to int8 to avoid overflow.
+		 * return value of pg_resgroup_get_status is stored in pg_proc.dat, and is loaded when initdb
+		 * to keep compatible with pre-existing database, 
+		 * this function searches pg_proc in syscache and parses the type.
+		 */
+		if (isResgroupUsingInt4()) 
+		{
+			TupleDescInitEntry(tupdesc, (AttrNumber) 4, "num_queued", INT4OID, -1, 0);
+			TupleDescInitEntry(tupdesc, (AttrNumber) 5, "num_executed", INT4OID, -1, 0);
+		}
+		else
+		{
+			TupleDescInitEntry(tupdesc, (AttrNumber) 4, "num_queued", INT8OID, -1, 0);
+			TupleDescInitEntry(tupdesc, (AttrNumber) 5, "num_executed", INT8OID, -1, 0);
+		}
+		
 		TupleDescInitEntry(tupdesc, (AttrNumber) 6, "total_queue_duration", INTERVALOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 7, "cpu_usage", JSONOID, -1, 0);
 
