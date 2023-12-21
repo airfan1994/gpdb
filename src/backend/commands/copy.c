@@ -3538,6 +3538,9 @@ CopyFrom(CopyState cstate)
 	bool	   *baseNulls;
 	GpDistributionData *part_distData = NULL;
 	int			firstBufferedLineNo = 0;
+	Oid        rootOid;
+ 	Relation   rootrel = NULL;
+ 	PartitionNode *rootpn = NULL;
 
 	Assert(cstate->rel);
 
@@ -3876,6 +3879,14 @@ CopyFrom(CopyState cstate)
 			if (!cstate->on_segment)
 				SendCopyFromForwardedHeader(cstate, cdbCopy);
 		}
+
+		Oid relid = RelationGetRelid(resultRelInfo->ri_RelationDesc);
+		if (rel_part_status(relid) == PART_STATUS_LEAF)
+		{
+			rootOid = rel_partition_get_master(relid);
+			rootrel = heap_open(rootOid, NoLock);
+			rootpn = RelationBuildPartitionDesc(rootrel, false);
+		}
 	}
 
 	CopyInitDataParser(cstate);
@@ -4011,6 +4022,25 @@ CopyFrom(CopyState cstate)
 
 			if (cstate->dispatch_mode == COPY_DISPATCH)
 			{
+				/* 
+ 				 * In QE, gpdb checks partition constraints.
+ 				 * However, constraint check pass when target value is null even null value is invalid for target partition.
+ 				 * So gpdb need to check target slot in QD before dispatch slot to QE.
+ 				 * */
+				if (rootpn)
+				{
+					estate->es_partition_state = createPartitionState(rootpn, estate->es_num_result_relations); 
+					Oid targetid = selectPartition(rootpn, 
+					                               slot_get_values(slot), 
+					                               slot_get_isnull(slot), 
+					                               tupDesc, 
+					                               estate->es_partition_state->accessMethods);
+					if (InvalidOid == targetid)
+					{
+						elog(ERROR, "Cannot copy to leaf partition, partition check violates.");
+					}
+				}
+
 				/* In QD, compute the target segment to send this row to. */
 				part_distData = GetDistributionPolicyForPartition(
 																  distData,
@@ -4425,6 +4455,11 @@ CopyFrom(CopyState cstate)
 	FreeDistributionData(distData);
 
 	FreeExecutorState(estate);
+
+	if (rootrel)
+	{
+		heap_close(rootrel, NoLock);
+	}
 
 	/*
 	 * If we skipped writing WAL, then we need to sync the heap (but not
